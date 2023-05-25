@@ -1,0 +1,4 @@
+[submodule "slab"]
+	path = slab
+	url = https://github.com/wyjin/slab.git
+	branch = dev

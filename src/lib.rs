@@ -105,6 +105,21 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         }
 
     }).collect();
+    
+    let lookup_table_fields_shrink_with_min_capacity: Vec<proc_macro2::TokenStream> = fields_to_index().map(|f|{
+        let index_name = format_ident!("_{}_index", f.ident.as_ref().unwrap());
+        let (ordering, _uniqueness) = get_index_kind(f).unwrap_or_else(|| {
+            abort_call_site!("Attributes must be in the style #[multi_index(hashed_unique)]")
+        });
+
+        match ordering {
+            Ordering::Hashed => quote! {
+                self.#index_name.shrink_to(min_capacity);
+            },
+            Ordering::Ordered => quote! {}
+        }
+
+    }).collect();
 
     // For each indexed field generate a TokenStream representing inserting the position in the backing storage to that field's lookup table
     // Unique indexed fields just require a simple insert to the map, whereas non-unique fields require inserting to the Set of positions,
@@ -525,6 +540,12 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                 // shrinking is slow. users are in control of when to shrink
                 self._store.shrink_to_fit();
                 #(#lookup_table_fields_shrink)* 
+            }
+
+            #element_vis fn shrink_to(&mut self, min_capacity: usize) {
+                // shrinking is slow. users are in control of when to shrink
+                self._store.shrink_to(min_capacity);
+                #(#lookup_table_fields_shrink_with_min_capacity)* 
             }
 
             #element_vis fn insert(&mut self, elem: #element_name) {

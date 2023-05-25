@@ -40,6 +40,10 @@ fn test_shrink() {
     map.shrink_to_fit();
     assert_eq!(map.capacity(), 10); 
 
+    map.reserve(20);
+    map.shrink_to(17);
+    assert_eq!(map.capacity(), 17);
+
     map.remove_by_field1(&5);
     map.remove_by_field1(&6);
     map.shrink_to_fit();
