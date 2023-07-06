@@ -1,13 +1,33 @@
 use ::convert_case::Casing;
 use ::proc_macro_error::{abort_call_site, proc_macro_error};
 use ::quote::{format_ident, quote};
-use ::syn::{parse_macro_input, DeriveInput};
+use ::syn::{parse_macro_input, DeriveInput, GenericParam, Type};
 
 #[proc_macro_derive(MultiIndexMap, attributes(multi_index))]
 #[proc_macro_error]
 pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     // Parse the input tokens into a syntax tree.
     let input = parse_macro_input!(input as DeriveInput);
+    let generics = input.generics;
+    // TODO: support other generics and trait bounds
+    if generics.where_clause.is_some() {
+        abort_call_site!("MultiIndexMap currently does not support where clause in generics");
+    }
+    let generics_inner: Vec<proc_macro2::TokenStream> = generics.params.iter().map(|g|
+        match g {
+            GenericParam::Lifetime(l) => quote! {#l,},
+            _ => abort_call_site!("MultiIndexMap currently supports only lifetime generics.")
+        }
+    ).collect();
+
+    let lifetimes: Vec<proc_macro2::TokenStream> = generics.lifetimes().map(|l| {
+        let lt = l.lifetime.clone();
+        quote!{#lt,}
+    }).collect();
+
+    let lifetimes_without_bounds = quote! {
+        <#(#lifetimes)*>
+    };
 
     // Extract the struct fields if we are parsing a struct,
     // otherwise throw an error as we do not support Enums or Unions.
@@ -139,10 +159,15 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
             let (_ordering, uniqueness) = get_index_kind(f).unwrap_or_else(|| {
                 abort_call_site!("Attributes must be in the style #[multi_index(hashed_unique)]")
             });
-
+            let ty = &f.ty;
+            let index_to_insert = if let Type::Reference(_) = ty {
+                quote!{elem.#field_name}
+            } else {
+                quote!{elem.#field_name.clone()}
+            };
             match uniqueness {
                 Uniqueness::Unique => quote! {
-                    let orig_elem_idx = self.#index_name.insert(elem.#field_name.clone(), idx);
+                    let orig_elem_idx = self.#index_name.insert(#index_to_insert, idx);
                     if orig_elem_idx.is_some() {
                         panic!(
                             "Unable to insert element, uniqueness constraint violated on field '{}'",
@@ -151,7 +176,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                     }
                 },
                 Uniqueness::NonUnique => quote! {
-                    self.#index_name.entry(elem.#field_name.clone())
+                    self.#index_name.entry(#index_to_insert)
                         .or_insert(::std::collections::BTreeSet::new())
                         .insert(idx);
                 },
@@ -232,6 +257,13 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
             ),
             field_name_string
         );
+        let ty = &f.ty;
+        let index_to_insert = if let Type::Reference(_) = ty {
+            quote!{elem.#field_name}
+        } else {
+            quote!{elem.#field_name.clone()}
+        };
+
         let (_ordering, uniqueness) = get_index_kind(f).unwrap_or_else(|| {
             abort_call_site!("Attributes must be in the style #[multi_index(hashed_unique)]")
         });
@@ -240,7 +272,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
             Uniqueness::Unique => quote! {
                 if elem.#field_name != elem_orig.#field_name {
                     let idx = self.#index_name.remove(&elem_orig.#field_name).expect(#error_msg);
-                    let orig_elem_idx = self.#index_name.insert(elem.#field_name.clone(), idx);
+                    let orig_elem_idx = self.#index_name.insert(#index_to_insert, idx);
                     if orig_elem_idx.is_some() {
                         panic!(
                             "Unable to insert element, uniqueness constraint violated on field '{}'",
@@ -260,7 +292,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                     } else {
                         self.#index_name.remove(&elem_orig.#field_name);
                     }
-                    self.#index_name.entry(elem.#field_name.clone())
+                    self.#index_name.entry(#index_to_insert)
                         .or_insert(::std::collections::BTreeSet::new())
                         .insert(idx);
                 }
@@ -311,12 +343,12 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         // in order to return a Vec of references to the backing storage.
         let getter = match uniqueness {
             Uniqueness::Unique => quote! {
-                #field_vis fn #getter_name(&self, key: &#ty) -> Option<&#element_name> {
+                #field_vis fn #getter_name(&self, key: &#ty) -> Option<&#element_name #lifetimes_without_bounds> {
                     Some(&self._store[*self.#index_name.get(key)?])
                 }
             },
             Uniqueness::NonUnique => quote! {
-                #field_vis fn #getter_name(&self, key: &#ty) -> Vec<&#element_name> {
+                #field_vis fn #getter_name(&self, key: &#ty) -> Vec<&#element_name #lifetimes_without_bounds> {
                     if let Some(idxs) = self.#index_name.get(key) {
                         let mut elem_refs = Vec::with_capacity(idxs.len());
                         for idx in idxs {
@@ -337,7 +369,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                 /// It is safe to mutate the non-indexed fields,
                 /// however mutating any of the indexed fields will break the internal invariants.
                 /// If the indexed fields need to be changed, the modify() method must be used.
-                #field_vis unsafe fn #mut_getter_name(&mut self, key: &#ty) -> Option<&mut #element_name> {
+                #field_vis unsafe fn #mut_getter_name(&mut self, key: &#ty) -> Option<&mut #element_name #lifetimes_without_bounds> {
                     Some(&mut self._store[*self.#index_name.get(key)?])
                 }
             },
@@ -346,7 +378,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                 /// It is safe to mutate the non-indexed fields,
                 /// however mutating any of the indexed fields will break the internal invariants.
                 /// If the indexed fields need to be changed, the modify() method must be used.
-                #field_vis unsafe fn #mut_getter_name(&mut self, key: &#ty) -> Vec<&mut #element_name> {
+                #field_vis unsafe fn #mut_getter_name(&mut self, key: &#ty) -> Vec<&mut #element_name #lifetimes_without_bounds> {
                     if let Some(idxs) = self.#index_name.get(key) {
                         let mut refs = Vec::with_capacity(idxs.len());
                         let mut mut_iter = self._store.iter_mut();
@@ -383,7 +415,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         let remover = match uniqueness {
             Uniqueness::Unique => quote! {
 
-                #field_vis fn #remover_name(&mut self, key: &#ty) -> Option<#element_name> {
+                #field_vis fn #remover_name(&mut self, key: &#ty) -> Option<#element_name #lifetimes_without_bounds> {
                     let idx = self.#index_name.remove(key)?;
                     let elem_orig = self._store.remove(idx);
                     #(#removes)*
@@ -391,7 +423,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                 }
             },
             Uniqueness::NonUnique => quote! {
-                #field_vis fn #remover_name(&mut self, key: &#ty) -> Vec<#element_name> {
+                #field_vis fn #remover_name(&mut self, key: &#ty) -> Vec<#element_name #lifetimes_without_bounds> {
                     if let Some(idxs) = self.#index_name.remove(key) {
                         let mut elems = Vec::with_capacity(idxs.len());
                         for idx in idxs {
@@ -418,7 +450,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                     &mut self,
                     key: &#ty,
                     f: impl FnOnce(&mut #element_name)
-                ) -> Option<&#element_name> {
+                ) -> Option<&#element_name #lifetimes_without_bounds> {
                     let idx = *self.#index_name.get(key)?;
                     let elem = &mut self._store[idx];
                     let elem_orig = elem.clone();
@@ -432,7 +464,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                     &mut self,
                     key: &#ty,
                     f: impl Fn(&mut #element_name)
-                ) -> Vec<&#element_name> {
+                ) -> Vec<&#element_name #lifetimes_without_bounds> {
                     let idxs = match self.#index_name.get(key) {
                         Some(container) => container.clone(),
                         _ => ::std::collections::BTreeSet::<usize>::new()
@@ -522,15 +554,15 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         // TokenStream representing the actual type of the iterator
         let iter_type = match uniqueness {
             Uniqueness::Unique => match ordering {
-                Ordering::Hashed => quote! {::std::collections::hash_map::Iter<'a, #ty, usize>},
-                Ordering::Ordered => quote! {::std::collections::btree_map::Iter<'a, #ty, usize>},
+                Ordering::Hashed => quote! {::std::collections::hash_map::Iter<'m_i_m_iter, #ty, usize>},
+                Ordering::Ordered => quote! {::std::collections::btree_map::Iter<'m_i_m_iter, #ty, usize>},
             },
             Uniqueness::NonUnique => match ordering {
                 Ordering::Hashed => {
-                    quote! {::std::collections::hash_map::Iter<'a, #ty, ::std::collections::BTreeSet::<usize>>}
+                    quote! {::std::collections::hash_map::Iter<'m_i_m_iter, #ty, ::std::collections::BTreeSet::<usize>>}
                 }
                 Ordering::Ordered => {
-                    quote! {::std::collections::btree_map::Iter<'a, #ty, ::std::collections::BTreeSet::<usize>>}
+                    quote! {::std::collections::btree_map::Iter<'m_i_m_iter, #ty, ::std::collections::BTreeSet::<usize>>}
                 }
             },
         };
@@ -588,37 +620,38 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
         // For ordered indices, we use _iter_rev to store a reversed iterator of the index field
         // TODO: code looks clumsy, need to refactor
         match ordering {
-            // HashMap does not implement the DoubleEndedIterator trait,
+            // HashMap does not implement the DoubleEndedIterator trait, so DoubleEndedIterator is only
+            // available for ordered indices
             Ordering::Hashed => quote! {
-                #field_vis struct #iter_name<'a> {
-                    _store_ref: &'a ::multi_index_map::slab::Slab<#element_name>,
+                #field_vis struct #iter_name<'m_i_m_iter, #(#generics_inner)*> {
+                    _store_ref: &'m_i_m_iter ::multi_index_map::slab::Slab<#element_name #lifetimes_without_bounds>,
                     _iter: #iter_type,
-                    _inner_iter: Option<Box<dyn ::std::iter::Iterator<Item=&'a usize> +'a>>,
+                    _inner_iter: Option<Box<dyn ::std::iter::Iterator<Item=&'m_i_m_iter usize> +'m_i_m_iter>>,
                 }
 
-                impl<'a> Iterator for #iter_name<'a> {
-                    type Item = &'a #element_name;
+                impl<'m_i_m_iter, #(#generics_inner)*> Iterator for #iter_name<'m_i_m_iter, #(#lifetimes)*> {
+                    type Item = &'m_i_m_iter #element_name #lifetimes_without_bounds;
                     fn next(&mut self) -> Option<Self::Item> {
                         #iter_action
                     }
                 }
             },
             Ordering::Ordered => quote! {
-                #field_vis struct #iter_name<'a> {
-                    _store_ref: &'a ::multi_index_map::slab::Slab<#element_name>,
+                #field_vis struct #iter_name<'m_i_m_iter, #(#generics_inner)*> {
+                    _store_ref: &'m_i_m_iter ::multi_index_map::slab::Slab<#element_name #lifetimes_without_bounds>,
                     _iter: #iter_type,
                     _iter_rev: ::std::iter::Rev<#iter_type>,
-                    _inner_iter: Option<Box<dyn ::std::iter::DoubleEndedIterator<Item=&'a usize> +'a>>,
+                    _inner_iter: Option<Box<dyn ::std::iter::DoubleEndedIterator<Item=&'m_i_m_iter usize> +'m_i_m_iter>>,
                 }
 
-                impl<'a> Iterator for #iter_name<'a> {
-                    type Item = &'a #element_name;
+                impl<'m_i_m_iter, #(#generics_inner)*> Iterator for #iter_name<'m_i_m_iter, #(#lifetimes)*> {
+                    type Item = &'m_i_m_iter #element_name #lifetimes_without_bounds;
                     fn next(&mut self) -> Option<Self::Item> {
                         #iter_action
                     }
                 }
 
-                impl<'a> DoubleEndedIterator for #iter_name<'a> {
+                impl<'m_i_m_iter, #(#generics_inner)*> DoubleEndedIterator for #iter_name<'m_i_m_iter, #(#lifetimes)*> {
                     fn next_back(&mut self) -> Option<Self::Item> {
                         #rev_iter_action
                     }
@@ -632,13 +665,13 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
     // Build the final output using quasi-quoting
     let expanded = quote! {
         #[derive(Default, Clone)]
-        #element_vis struct #map_name {
-            _store: ::multi_index_map::slab::Slab<#element_name>,
+        #element_vis struct #map_name #generics {
+            _store: ::multi_index_map::slab::Slab<#element_name #lifetimes_without_bounds>,
             #(#lookup_table_fields)*
         }
 
-        impl #map_name {
-            #element_vis fn with_capacity(n: usize) -> #map_name {
+        impl #generics #map_name #lifetimes_without_bounds {
+            #element_vis fn with_capacity(n: usize) -> #map_name #lifetimes_without_bounds {
                 #map_name {
                     _store: ::multi_index_map::slab::Slab::with_capacity(n),
                     #(#lookup_table_fields_init)*
@@ -669,7 +702,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
                 #(#lookup_table_fields_shrink)*
             }
 
-            #element_vis fn insert(&mut self, elem: #element_name) {
+            #element_vis fn insert(&mut self, elem: #element_name #lifetimes_without_bounds) {
                 let idx = self._store.insert(elem);
                 let elem = &self._store[idx];
 
@@ -682,7 +715,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
             }
 
             // Allow iteration directly over the backing storage
-            #element_vis fn iter(&self) -> ::multi_index_map::slab::Iter<#element_name> {
+            #element_vis fn iter(&self) -> ::multi_index_map::slab::Iter<#element_name #lifetimes_without_bounds> {
                 self._store.iter()
             }
 
@@ -690,7 +723,7 @@ pub fn multi_index_map(input: proc_macro::TokenStream) -> proc_macro::TokenStrea
             /// It is safe to mutate the non-indexed fields,
             /// however mutating any of the indexed fields will break the internal invariants.
             /// If the indexed fields need to be changed, the modify() method must be used.
-            #element_vis unsafe fn iter_mut(&mut self) -> ::multi_index_map::slab::IterMut<#element_name> {
+            #element_vis unsafe fn iter_mut(&mut self) -> ::multi_index_map::slab::IterMut<#element_name #lifetimes_without_bounds> {
                 self._store.iter_mut()
             }
 
